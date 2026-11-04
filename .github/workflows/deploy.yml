@@ -1,0 +1,50 @@
+name: Deploy to EC2
+
+# main에 코드가 올라오면 자동 배포. Actions 탭에서 수동 실행도 가능
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 배포가 동시에 두 개 돌지 않도록 한 줄로 세움 (앞 배포가 끝나야 다음 배포 시작)
+concurrency:
+  group: deploy-ec2
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 코드 가져오기
+        uses: actions/checkout@v4
+
+      - name: SSH 키 준비
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/ec2.pem
+          chmod 600 ~/.ssh/ec2.pem
+          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: EC2에 배포 (scripts/deploy.sh 실행)
+        run: |
+          ssh -i ~/.ssh/ec2.pem "${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}" 'bash -s' < scripts/deploy.sh
+
+      - name: 외부에서 접속 확인
+        run: |
+          for i in $(seq 1 12); do
+            if curl -fsS "http://${{ secrets.EC2_HOST }}:8501/_stcore/health"; then
+              echo ""
+              echo "웹 서비스 정상 응답: http://${{ secrets.EC2_HOST }}:8501"
+              exit 0
+            fi
+            echo "대기 중... ($i/12)"
+            sleep 5
+          done
+          echo "웹 서비스에 접속할 수 없습니다 (보안 그룹 8501 포트 확인)"
+          exit 1
+
+      - name: SSH 키 삭제
+        if: always()
+        run: rm -f ~/.ssh/ec2.pem
