@@ -102,7 +102,7 @@ def log_model_info():
 log_model_info()
 actual_data = load_actual()
 
-st.title("🚲 서울시 자전거 대여량 예측 시스템")
+st.title("🚲 서울시 따릉이 대여량 예측 시스템")
 st.write("날짜와 날씨를 입력하면 **0시~23시, 시간대별 예상 자전거 대여량**을 알려드립니다.")
 st.caption("2017-12-01 ~ 2018-11-30 사이 날짜를 고르면 실제 대여량과 비교해 볼 수 있어요.")
 
