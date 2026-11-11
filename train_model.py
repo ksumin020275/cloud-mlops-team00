@@ -72,6 +72,16 @@ if __name__ == '__main__':
     model_mae = mean_absolute_error(y[test_mask], pred)
     model_r2 = r2_score(y[test_mask], pred)
 
+    # 평가 기간 예측 결과 저장 → 화면의 '예측 vs 실제 비교' 탭에서 사용
+    #   (평가 기간을 보지 않고 학습한 모델의 예측이라 정직한 비교가 됨)
+    pd.DataFrame({
+        'Date': df['Date'][test_mask].dt.strftime('%Y-%m-%d').values,
+        'Hour': df['Hour'][test_mask].values,
+        'Actual': y[test_mask].values,
+        'Predicted': pred.clip(min=0).round().astype(int),
+        'Baseline': [int(round(b)) for b in base_pred],
+    }).to_csv('test_predictions.csv', index=False)
+
     print(f"\n[단순 비교 기준] MAE: {base_mae:.1f}대")
     print(f"[XGBoost 모델]   MAE: {model_mae:.1f}대, R2: {model_r2:.3f}")
     print(f"→ 기준 대비 오차 {(1 - model_mae / base_mae) * 100:.1f}% 감소")
@@ -82,4 +92,4 @@ if __name__ == '__main__':
     with open('metrics.json', 'w', encoding='utf-8') as f:
         json.dump({'mae': round(float(model_mae), 1), 'r2': round(float(model_r2), 3),
                    'baseline_mae': round(float(base_mae), 1)}, f, ensure_ascii=False)
-    print("\n모델(xgboost_bike_model.pkl)과 평가 결과(metrics.json) 저장 완료!")
+    print("\n모델(xgboost_bike_model.pkl), 평가 결과(metrics.json), 평가 기간 예측(test_predictions.csv) 저장 완료!")
