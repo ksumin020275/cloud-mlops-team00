@@ -48,290 +48,229 @@ SEASON_BY_MONTH = {12: 'Winter', 1: 'Winter', 2: 'Winter', 3: 'Spring', 4: 'Spri
                    6: 'Summer', 7: 'Summer', 8: 'Summer', 9: 'Autumn', 10: 'Autumn', 11: 'Autumn'}
 SEASON_KR = {'Spring': '봄', 'Summer': '여름', 'Autumn': '가을', 'Winter': '겨울'}
 WEEKDAY_KR = ['월', '화', '수', '목', '금', '토', '일']
-EXTRA_HOLIDAYS = {datetime.date(2018, 9, 26)}
+EXTRA_HOLIDAYS = {datetime.date(2018, 9, 26)}      # 원본 데이터에 평일로 잘못 표시된 공휴일 (추석 대체공휴일)
+RECORD_START, RECORD_END = datetime.date(2017, 12, 1), datetime.date(2018, 11, 30)
+TOTAL_TOL = 20                                     # 하루 총량 차이가 ±20% 이내면 '잘 맞힘'
 
 
+# =============================== 데이터·모델 ===============================
 @st.cache_resource
 def load_model():
     return joblib.load('xgboost_bike_model.pkl')
 
 
 @st.cache_data
-def load_actual():
-    """SeoulBikeData.csv에서 날짜·시간별 실제 대여량을 불러옴 (운영한 날만)"""
-    if not os.path.exists('SeoulBikeData.csv'):
-        return None
-    try:
-        df = pd.read_csv('SeoulBikeData.csv', encoding='utf-8')
-    except UnicodeDecodeError:
-        df = pd.read_csv('SeoulBikeData.csv', encoding='cp949')
-    df = df.iloc[:, [0, 1, 2, 3, 9, 12, 13]]
-    df.columns = ['Date', 'Count', 'Hour', 'Temp', 'Rain', 'Holiday', 'Functioning']
-    df['Date'] = pd.to_datetime(df['Date'], format='%d/%m/%Y').dt.date
-    # 원본 데이터에 평일로 잘못 표시된 공휴일 보정 (2018-09-26 추석 대체공휴일)
-    df.loc[df['Date'].isin(EXTRA_HOLIDAYS), 'Holiday'] = 'Holiday'
-    return df
+def load_backtest():
+    """train_model.py가 만든 과거 기록 확인용 예측
+    (각 날짜가 속한 달을 빼고 학습한 모델의 예측 → 모델이 정답을 모르는 상태의 예측)"""
+    if not os.path.exists('backtest_predictions.csv'):
+        return None, None
+    hourly = pd.read_csv('backtest_predictions.csv')
+    hourly['Date'] = pd.to_datetime(hourly['Date']).dt.date
+    hourly.loc[hourly['Date'].isin(EXTRA_HOLIDAYS), 'Holiday'] = 1
+    daily = (hourly.groupby('Date')
+             .agg(Actual=('Actual', 'sum'), Predicted=('Predicted', 'sum'), temp=('Temp', 'mean'),
+                  humidity=('Humidity', 'mean'), rain=('Rain', 'sum'), holiday=('Holiday', 'max'),
+                  weekend=('Weekend', 'max'))
+             .reset_index())
+    daily['dayoff'] = (daily['holiday'] == 1) | (daily['weekend'] == 1)
+    daily['err'] = (daily['Predicted'] - daily['Actual']).abs() / daily['Actual'] * 100
+    return hourly, daily
 
 
-@st.cache_data
-def load_test_predictions():
-    """train_model.py가 저장한 평가 기간(학습에 쓰지 않은 기간)의 예측값과 실제값"""
-    if not os.path.exists('test_predictions.csv'):
-        return None
-    df = pd.read_csv('test_predictions.csv')
-    df['Date'] = pd.to_datetime(df['Date']).dt.date
-    return df
+def predict_hours(model, date, temps, hums, winds, rains, holidays):
+    """0~23시 예측. 날씨는 24개 값(시간대별) 리스트"""
+    X = make_features(list(range(24)), temps, hums, winds, rains,
+                      [SEASON_BY_MONTH[date.month]] * 24, holidays, [date.weekday() >= 5] * 24)
+    return model.predict(X).clip(min=0).round().astype(int)
 
 
-def find_similar_day(date, temp, rain, is_holiday):
-    """평가 기간(학습에 안 쓴 기간) 중 입력 조건과 가장 비슷한 날을 찾음
-    - 쉬는 날(주말·공휴일)인지 평일인지가 같은 날 중에서
-    - 하루 평균 기온과 시간당 강수량이 가장 가까운 날"""
-    if test_pred is None or actual_data is None:
-        return None
-    test_dates = set(test_pred['Date'])
-    days = (actual_data[actual_data['Date'].isin(test_dates)]
-            .groupby('Date')
-            .agg(temp=('Temp', 'mean'), rain=('Rain', 'mean'),
-                 holiday=('Holiday', lambda h: (h == 'Holiday').any()))
-            .reset_index())
-    days['dayoff'] = days['Date'].map(lambda d: d.weekday() >= 5) | days['holiday']
-    want_dayoff = date.weekday() >= 5 or is_holiday
-    cand = days[days['dayoff'] == want_dayoff]
-    if cand.empty:
-        cand = days
-    score = (cand['temp'] - temp).abs() / 5 + (cand['rain'] - rain).abs() * 2
-    return cand.loc[score.idxmin()]
+def date_text(d):
+    return f"{d} ({WEEKDAY_KR[d.weekday()]})"
 
 
-def show_compare_strip(caption, day_label, day_sub, actual_total, pred_total, pred_label, note):
-    """예측 vs 실제를 가로 띠 한 줄로 보여줌: 구분 | 날짜 | 실제 | 예측 | 오차 판정"""
-    err = abs(pred_total - actual_total) / actual_total * 100 if actual_total else 0
+def weather_text(temp, rain_day):
+    return f"{temp:.1f}℃ · " + ("비 없음" if rain_day < 0.1 else f"비 {rain_day:.1f}mm")
+
+
+def diff_badge(actual, predicted):
+    err = abs(predicted - actual) / actual * 100 if actual else 0
     ok = err <= TOTAL_TOL
-    color = "#177233" if ok else "#c0392b"
-    cell = "padding:12px 20px;border-left:1px solid #eee"
-    small = "font-size:12px;color:#808495"
+    return err, ok, ("#177233" if ok else "#c0392b"), ("잘 맞힘" if ok else "많이 빗나감")
+
+
+def show_strip(title, subtitle, cells, actual, predicted):
+    """가로 띠 한 줄: [제목] | 칸들 | 차이 %"""
+    err, ok, color, word = diff_badge(actual, predicted)
+    small = "font-size:12px;opacity:0.65"
+    cell_style = "padding:12px 20px;border-left:1px solid rgba(128,128,128,0.25)"
+    cells_html = "".join(
+        f'<div style="{cell_style}"><div style="{small}">{label}</div>'
+        f'<div style="font-size:{size}px;font-weight:{600 if size < 20 else 400}">{value}</div>'
+        f'<div style="{small}">{sub}</div></div>'
+        for label, value, sub, size in cells)
     st.markdown(f"""
-<div style="display:flex;flex-wrap:wrap;align-items:center;border:1px solid #d6d6d9;border-radius:10px;overflow:hidden;margin:8px 0 4px">
-  <div style="background:#f6f7f9;padding:16px 18px;white-space:nowrap">
-    <div style="font-weight:700;font-size:15px">📊 예측 vs 실제</div><div style="{small}">{caption}</div></div>
-  <div style="{cell}"><div style="{small}">{day_label}</div>
-    <div style="font-size:17px;font-weight:600">{day_sub[0]}</div><div style="{small}">{day_sub[1]}</div></div>
-  <div style="{cell}"><div style="{small}">실제</div><div style="font-size:26px">{actual_total:,}대</div></div>
-  <div style="{cell}"><div style="{small}">{pred_label}</div><div style="font-size:26px">{pred_total:,}대</div></div>
-  <div style="margin-left:auto;padding:0 22px;text-align:center;white-space:nowrap">
+<div style="display:flex;flex-wrap:wrap;align-items:center;border:1px solid rgba(128,128,128,0.4);
+            border-radius:10px;overflow:hidden;margin:8px 0 4px;color:inherit">
+  <div style="background:rgba(128,128,128,0.10);padding:16px 18px;white-space:nowrap">
+    <div style="font-weight:700;font-size:15px">{title}</div><div style="{small}">{subtitle}</div></div>
+  {cells_html}
+  <div style="margin-left:auto;padding:8px 22px;text-align:center;white-space:nowrap">
     <div style="font-size:30px;font-weight:700;color:{color}">{'✅' if ok else '❌'} {err:.0f}%</div>
-    <div style="{small}">오차 · {'적중' if ok else '빗나감'} (±{TOTAL_TOL}%)</div></div>
+    <div style="{small}">차이 · {word}</div></div>
 </div>""", unsafe_allow_html=True)
-    st.caption(note)
-
-
-def weather_text(temp, rain):
-    return f"{temp:.1f}℃ · " + ("비 없음" if rain < 0.05 else f"비 {rain:.1f}mm/시간")
-
-
-def load_metrics():
-    if os.path.exists('metrics.json'):
-        with open('metrics.json', encoding='utf-8') as f:
-            return json.load(f)
-    return None
-
-
-def predict_day(model, date, temp, humidity, wind, rain, is_holiday):
-    """다음 날 0~23시, 24시간 각각의 대여량을 예측"""
-    hours = list(range(24))
-    season = SEASON_BY_MONTH[date.month]
-    weekend = date.weekday() >= 5
-    X = make_features(hours, [temp] * 24, [humidity] * 24, [wind] * 24, [rain] * 24,
-                      [season] * 24, [is_holiday] * 24, [weekend] * 24)
-    pred = model.predict(X).clip(min=0).round().astype(int)
-    return pd.DataFrame({'시간': hours, '예상 대여량(대)': pred})
 
 
 model = load_model()
-metrics = load_metrics()
+bt_hourly, bt_daily = load_backtest()
+HOUR_MAE = float((bt_hourly['Predicted'] - bt_hourly['Actual']).abs().mean()) if bt_hourly is not None else None
 
 
 @st.cache_resource
 def log_model_info():
     # [로그] 앱 시작 시 한 번: 지금 서비스 중인 모델 정보
-    log_event("model_loaded", metrics=metrics)
+    log_event("model_loaded", backtest_hour_mae=round(HOUR_MAE, 1) if HOUR_MAE else None)
     return True
 
 
 log_model_info()
-actual_data = load_actual()
-test_pred = load_test_predictions()
 
-HOUR_TOL = metrics['mae'] if metrics else 240   # 시간당 허용 오차 = 모델의 실제 MAE
-TOTAL_TOL = 20                                   # 하루 총량 허용 오차율(%)
-
+# ================================= 화면 =================================
 st.title("🚲 서울시 따릉이 대여량 예측 시스템")
-st.write("날짜와 날씨를 입력하면 **0시~23시, 시간대별 예상 자전거 대여량**을 알려드립니다.")
+st.write("날씨에 따라 **하루 동안(0~23시) 따릉이를 몇 대 빌릴지** 예측하는 서비스예요.")
 
-st.sidebar.header("예측 조건 입력")
-st.sidebar.caption("'🔮 예측하기' 탭에서 사용하는 입력값이에요.")
-date = st.sidebar.date_input("예측할 날짜", datetime.date.today() + datetime.timedelta(days=1),
-                             min_value=datetime.date(2017, 1, 1), max_value=datetime.date(2035, 12, 31))
-season = SEASON_BY_MONTH[date.month]
-st.sidebar.caption(f"{WEEKDAY_KR[date.weekday()]}요일 · {SEASON_KR[season]} (날짜로 자동 판단)")
-temp = st.sidebar.number_input("기온 (℃)", value=20.0, step=0.5)
-humidity = st.sidebar.slider("습도 (%)", 0, 100, 50)
-wind = st.sidebar.number_input("풍속 (m/s)", value=1.5, min_value=0.0, step=0.1)
-rain = st.sidebar.number_input("강수량 (mm)", value=0.0, min_value=0.0, step=0.5)
-holiday_input = st.sidebar.radio("공휴일 여부", ['평일', '공휴일'])
+tab_predict, tab_check, tab_score = st.tabs(["🔮 예측하기", "✅ 과거 기록으로 확인하기", "📊 전체 성적표"])
 
-tab_predict, tab_compare = st.tabs(["🔮 예측하기", "📊 예측 vs 실제 비교"])
-
-# =========================== 탭 1: 예측하기 ===========================
+# ------------------------------ 탭 1: 예측하기 ------------------------------
 with tab_predict:
-    st.caption("2017-12-01 ~ 2018-11-30 사이 날짜를 고르면 실제 대여량과 비교해 볼 수 있어요.")
-    if st.button("예상 대여량 확인하기"):
-        result = predict_day(model, date, temp, humidity, wind, rain, holiday_input == '공휴일')
+    st.caption("예측할 날짜와 그날의 **날씨 예보**를 넣고 [예측하기]를 누르세요.")
+    with st.form("predict_form"):
+        r1 = st.columns([2, 2, 3])
+        date = r1[0].date_input("📅 날짜", datetime.date.today() + datetime.timedelta(days=1),
+                                min_value=RECORD_END + datetime.timedelta(days=1),
+                                max_value=datetime.date(2035, 12, 31))
+        is_holiday = r1[1].radio("공휴일인가요?", ["아니요", "네"], horizontal=True) == "네"
+        r2 = st.columns(4)
+        temp = r2[0].number_input("🌡️ 평균 기온 (℃)", value=20.0, step=0.5, min_value=-20.0, max_value=40.0)
+        humidity = r2[1].number_input("💧 습도 (%)", value=50, step=5, min_value=0, max_value=100)
+        wind = r2[2].number_input("🍃 풍속 (m/s)", value=1.5, step=0.1, min_value=0.0, max_value=10.0)
+        rain_day = r2[3].number_input("☔ 하루 강수량 (mm)", value=0.0, step=1.0, min_value=0.0, max_value=200.0)
+        submitted = st.form_submit_button("🔮 예측하기", type="primary", use_container_width=True)
 
-        # [로그] 예측 요청: 입력값과 24시간 예측값 (재학습 시 입력 X)
-        request_id = str(uuid.uuid4())
-        log_event("prediction", request_id=request_id,
-                  input={"date": date, "temp": temp, "humidity": humidity, "wind": wind, "rain": rain,
-                         "holiday": int(holiday_input == '공휴일'), "weekend": int(date.weekday() >= 5),
-                         "season": season},
-                  pred_total=int(result['예상 대여량(대)'].sum()),
-                  pred_hourly=result['예상 대여량(대)'].tolist())
-        peak = result.loc[result['예상 대여량(대)'].idxmax()]
+    if submitted:
+        pred = predict_hours(model, date, [temp] * 24, [humidity] * 24, [wind] * 24,
+                             [rain_day / 24] * 24, [is_holiday] * 24)
+        total, peak = int(pred.sum()), int(pred.argmax())
 
-        # 데이터에 있는 날짜면 실제 대여량을 함께 보여줌
-        day = None
-        if actual_data is not None:
-            day = actual_data[actual_data['Date'] == date].sort_values('Hour')
-            if len(day) != 24:
-                day = None
+        # [로그] 예측 요청: 입력값과 24시간 예측값
+        log_event("prediction", request_id=str(uuid.uuid4()), source="forecast",
+                  input={"date": date, "temp": temp, "humidity": humidity, "wind": wind,
+                         "rain_day": rain_day, "holiday": int(is_holiday),
+                         "weekend": int(date.weekday() >= 5), "season": SEASON_BY_MONTH[date.month]},
+                  pred_total=total, pred_hourly=pred.tolist())
 
-        c1, c2 = st.columns(2)
-        c1.metric("하루 총 예상 대여량", f"{result['예상 대여량(대)'].sum():,}대")
-        c2.metric("가장 붐비는 시간", f"{int(peak['시간'])}시", f"{int(peak['예상 대여량(대)']):,}대")
+        st.markdown(f"#### {date_text(date)} 예측 결과")
+        m = st.columns(3)
+        m[0].metric("하루 동안 빌릴 자전거", f"{total:,}대")
+        m[1].metric("가장 붐비는 시간", f"{peak}시", f"{pred[peak]:,}대", delta_color="off")
+        m[2].metric("가장 한가한 시간", f"{int(pred.argmin())}시", f"{pred.min():,}대", delta_color="off")
+        st.bar_chart(pd.DataFrame({'예측 대여량(대)': pred}, index=pd.Index(range(24), name='시간')))
 
-        if day is not None and (day['Functioning'] == 'No').all():
-            st.warning("이 날은 따릉이를 운영하지 않은 날이라 실제 대여량이 0대입니다. 비교에서 제외하세요.")
-            day = None
+        # 이 예측을 얼마나 믿을 수 있는지: 날씨가 비슷했던 과거 날의 실제 vs 예측
+        if bt_daily is not None:
+            want_off = is_holiday or date.weekday() >= 5
+            cand = bt_daily[bt_daily['dayoff'] == want_off]
+            score = (cand['temp'] - temp).abs() / 5 + (cand['rain'] - rain_day).abs() / 10
+            sim = cand.loc[score.idxmin()]
+            st.markdown("#### 🎯 이 예측, 얼마나 믿을 수 있을까요?")
+            show_strip("날씨가 비슷했던 날", "그날 모델이 얼마나 맞혔는지",
+                       [("날짜", date_text(sim['Date']), weather_text(sim['temp'], sim['rain']), 17),
+                        ("실제로 빌린 대수", f"{int(sim['Actual']):,}대", "", 26),
+                        ("모델의 예측", f"{int(sim['Predicted']):,}대", "", 26)],
+                       int(sim['Actual']), int(sim['Predicted']))
+            st.caption(f"※ 과거 기록 중 {'쉬는 날' if want_off else '평일'}이면서 기온·강수량이 가장 비슷했던 날이에요. "
+                       f"차이가 ±{TOTAL_TOL}% 안이면 '잘 맞힘'이에요.")
 
-        # ---- 예측 vs 실제 비교 띠 ----
-        in_test = test_pred is not None and date in set(test_pred['Date'])
-        if day is not None:
-            actual_total = int(day['Count'].sum())
-            result['실제 대여량(대)'] = day['Count'].values
-            result['오차(대)'] = (result['예상 대여량(대)'] - result['실제 대여량(대)']).abs()
-            result['판정'] = result['오차(대)'].apply(lambda e: '✅' if e <= HOUR_TOL else '❌')
-            day_sub = (f"{date} ({WEEKDAY_KR[date.weekday()]})",
-                       weather_text(day['Temp'].mean(), day['Rain'].mean()))
-            if in_test:
-                # 학습에 안 쓴 기간 → 그날 실제 날씨로 예측했던 값과 비교 (정직한 비교)
-                pred_total = int(test_pred[test_pred['Date'] == date]['Predicted'].sum())
-                show_compare_strip("선택한 날짜의 실제 기록", "선택한 날짜", day_sub,
-                                   actual_total, pred_total, "당시 예측",
-                                   "※ 학습에 쓰지 않은 기간이라, 그날 실제 날씨로 예측했던 값과 비교했어요.")
-            else:
-                pred_total = int(result['예상 대여량(대)'].sum())
-                show_compare_strip("선택한 날짜의 실제 기록", "선택한 날짜", day_sub,
-                                   actual_total, pred_total, "입력값으로 예측",
-                                   "※ 이 날짜는 모델 학습에 사용돼서 실제보다 잘 맞게 나올 수 있어요. "
-                                   "정직한 비교는 2018-09-11 ~ 11-30 날짜로 해 보세요.")
-
-            # [로그] 실제값 피드백: 정답과 오차 (재학습 시 정답 y, 성능 저하 감지)
-            log_event("actual", request_id=request_id, date=date,
-                      actual_total=actual_total, pred_total=pred_total,
-                      total_error_rate=round(abs(pred_total - actual_total) / actual_total * 100, 1),
-                      mean_abs_error=round(float(result['오차(대)'].mean()), 1),
-                      actual_hourly=result['실제 대여량(대)'].tolist(),
-                      abs_error_hourly=result['오차(대)'].tolist())
-        else:
-            # 미래 날짜 → 조건이 비슷했던 과거 날짜에서 모델이 얼마나 맞혔는지
-            sim = find_similar_day(date, temp, rain, holiday_input == '공휴일')
-            if sim is None:
-                st.info("비교 데이터(test_predictions.csv)가 없어 비교할 수 없어요. train_model.py를 먼저 실행하세요.")
-            else:
-                sd = sim['Date']
-                one = test_pred[test_pred['Date'] == sd]
-                show_compare_strip("비슷했던 날로 검증", "비슷했던 날",
-                                   (f"{sd} ({WEEKDAY_KR[sd.weekday()]})", weather_text(sim['temp'], sim['rain'])),
-                                   int(one['Actual'].sum()), int(one['Predicted'].sum()), "당시 예측",
-                                   "※ 실제값이 아직 없는 날짜라, 쉬는 날 여부가 같고 기온·강수량이 가장 비슷했던 날"
-                                   "(학습에 쓰지 않은 기간)에서 모델이 얼마나 맞혔는지 보여줘요.")
-
-        # ---- 예측 그래프 ----
-        st.subheader(f"{date} ({WEEKDAY_KR[date.weekday()]}) 시간대별 예상 대여량")
-        st.bar_chart(result.set_index('시간')[['예상 대여량(대)']])
         with st.expander("시간대별 숫자로 보기"):
-            st.dataframe(result, hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame({'시간': range(24), '예측 대여량(대)': pred}),
+                         hide_index=True, use_container_width=True)
+        st.caption("※ 하루 동안 날씨가 같다고 보고 예측해요. 날씨 예보가 정확할수록 예측도 정확해져요.")
 
-        if metrics:
-            st.info(f"💡 최근 기간 데이터로 검증한 평균 오차(MAE)는 시간당 약 ±{metrics['mae']:.0f}대입니다. "
-                    f"(단순 평균 방식은 ±{metrics['baseline_mae']:.0f}대) 여유 수량을 준비하세요.")
-        st.caption("※ 하루 동안 날씨가 같다고 가정한 예측입니다.")
-
-# ======================= 탭 2: 예측 vs 실제 비교 =======================
-with tab_compare:
-    if test_pred is None:
-        st.warning("비교 데이터(test_predictions.csv)가 없습니다. train_model.py를 먼저 실행하세요.")
+# ------------------------ 탭 2: 과거 기록으로 확인하기 ------------------------
+with tab_check:
+    st.caption(f"{RECORD_START} ~ {RECORD_END} 중 날짜를 고르면, **그날 실제로 빌린 대수**와 "
+               "**모델의 예측**을 비교해요. 날씨는 그날의 실제 날씨가 자동으로 들어가요.")
+    if bt_hourly is None:
+        st.warning("비교 데이터(backtest_predictions.csv)가 없어요. train_model.py를 먼저 실행하세요.")
     else:
-        st.write("모델이 **학습할 때 보지 않은 기간**(가장 최근 기간)의 실제 대여량과 예측값을 비교합니다.")
-        start, end = test_pred['Date'].min(), test_pred['Date'].max()
-        st.caption(f"평가 기간: {start} ~ {end} · 이 기간의 데이터는 모델 학습에 사용하지 않았어요.")
+        pick = st.date_input("📅 확인할 날짜", datetime.date(2018, 10, 17),
+                             min_value=RECORD_START, max_value=RECORD_END, key="check_date")
+        one = bt_hourly[bt_hourly['Date'] == pick].sort_values('Hour')
+        if one.empty:
+            st.warning("이 날은 따릉이를 운영하지 않아 기록이 없어요. 다른 날짜를 골라 주세요.")
+        else:
+            row = bt_daily[bt_daily['Date'] == pick].iloc[0]
+            kind = "공휴일" if row['holiday'] else ("주말" if row['weekend'] else "평일")
+            show_strip("예측 vs 실제", f"{kind} · {weather_text(row['temp'], row['rain'])}",
+                       [("날짜", date_text(pick), f"습도 {row['humidity']:.0f}%", 17),
+                        ("실제로 빌린 대수", f"{int(row['Actual']):,}대", "", 26),
+                        ("모델의 예측", f"{int(row['Predicted']):,}대", "", 26)],
+                       int(row['Actual']), int(row['Predicted']))
+            st.line_chart(pd.DataFrame({'실제': one['Actual'].values, '예측': one['Predicted'].values},
+                                       index=pd.Index(one['Hour'].values, name='시간')))
+            with st.expander("시간대별 숫자로 보기"):
+                st.dataframe(pd.DataFrame({'시간': one['Hour'].values, '실제(대)': one['Actual'].values,
+                                           '예측(대)': one['Predicted'].values,
+                                           '차이(대)': (one['Predicted'] - one['Actual']).values}),
+                             hide_index=True, use_container_width=True)
+            st.caption("※ 공정한 비교를 위해, 이 날짜가 속한 **달을 빼고 학습한 모델**이 예측한 값이에요. "
+                       "(모델이 정답을 모르는 상태에서 한 예측)")
 
-        # ---- 1) 성적표 ----
-        daily = test_pred.groupby('Date')[['Actual', 'Predicted', 'Baseline']].sum().reset_index()
-        daily['오차율(%)'] = (daily['Predicted'] - daily['Actual']).abs() / daily['Actual'] * 100
-        hit_rate = (daily['오차율(%)'] <= TOTAL_TOL).mean() * 100
-        mae = (test_pred['Predicted'] - test_pred['Actual']).abs().mean()
-        base_mae = (test_pred['Baseline'] - test_pred['Actual']).abs().mean()
+            # [로그] 예측 + 실제값 피드백 (같은 날짜는 한 번만 기록) → 재학습 데이터
+            if st.session_state.get("logged_check") != pick:
+                rid = str(uuid.uuid4())
+                log_event("prediction", request_id=rid, source="backtest",
+                          input={"date": pick, "temp": round(float(row['temp']), 1),
+                                 "humidity": round(float(row['humidity']), 1),
+                                 "rain_day": round(float(row['rain']), 1), "holiday": int(row['holiday']),
+                                 "weekend": int(row['weekend']), "season": SEASON_BY_MONTH[pick.month]},
+                          pred_total=int(row['Predicted']), pred_hourly=one['Predicted'].tolist())
+                log_event("actual", request_id=rid, date=pick, actual_total=int(row['Actual']),
+                          pred_total=int(row['Predicted']), total_error_rate=round(float(row['err']), 1),
+                          actual_hourly=one['Actual'].tolist(),
+                          abs_error_hourly=(one['Predicted'] - one['Actual']).abs().tolist())
+                st.session_state["logged_check"] = pick
 
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("시간당 평균 오차 (MAE)", f"{mae:.0f}대")
-        m2.metric("단순 평균 대비", f"{(1 - mae / base_mae) * 100:.0f}% 개선",
-                  f"단순 평균 오차 {base_mae:.0f}대", delta_color="off")
-        m3.metric(f"하루 총량 ±{TOTAL_TOL}% 적중", f"{hit_rate:.0f}%",
-                  f"{int((daily['오차율(%)'] <= TOTAL_TOL).sum())}/{len(daily)}일", delta_color="off")
-        m4.metric("하루 총량 평균 오차율", f"{daily['오차율(%)'].mean():.1f}%")
+# ------------------------------ 탭 3: 전체 성적표 ------------------------------
+with tab_score:
+    if bt_daily is None:
+        st.warning("비교 데이터(backtest_predictions.csv)가 없어요. train_model.py를 먼저 실행하세요.")
+    else:
+        n_ok = int((bt_daily['err'] <= TOTAL_TOL).sum())
+        st.caption(f"{RECORD_START} ~ {RECORD_END}, 기록이 있는 {len(bt_daily)}일 전체를 모델이 얼마나 맞혔는지 보여줘요.")
+        m = st.columns(3)
+        m[0].metric("잘 맞힌 날", f"{n_ok / len(bt_daily) * 100:.0f}%", f"{n_ok}/{len(bt_daily)}일 (차이 ±{TOTAL_TOL}% 이내)",
+                    delta_color="off")
+        m[1].metric("하루 총량 차이 (중간값)", f"{bt_daily['err'].median():.0f}%")
+        m[2].metric("시간당 평균 차이", f"±{HOUR_MAE:.0f}대")
 
-        # ---- 2) 기간 전체: 하루 총량 비교 ----
-        st.subheader("날짜별 하루 총 대여량: 예측 vs 실제")
-        chart = daily.rename(columns={'Actual': '실제', 'Predicted': '예측'}).set_index('Date')[['실제', '예측']]
-        st.line_chart(chart)
+        st.markdown("#### 날짜별 하루 대여량: 실제 vs 예측")
+        st.line_chart(bt_daily.set_index('Date')[['Actual', 'Predicted']].rename(
+            columns={'Actual': '실제', 'Predicted': '예측'}))
 
-        # ---- 3) 날짜 하나 골라서 시간대별 비교 ----
-        st.subheader("날짜를 골라 시간대별로 비교하기")
-        dates = list(daily['Date'])
-        pick = st.selectbox("비교할 날짜", dates,
-                            format_func=lambda d: f"{d} ({WEEKDAY_KR[d.weekday()]})")
-        one = test_pred[test_pred['Date'] == pick].sort_values('Hour')
-        one_view = pd.DataFrame({
-            '시간': one['Hour'].values,
-            '실제 대여량(대)': one['Actual'].values,
-            '예측 대여량(대)': one['Predicted'].values,
-        })
-        one_view['오차(대)'] = (one_view['예측 대여량(대)'] - one_view['실제 대여량(대)']).abs()
-        one_view['판정'] = one_view['오차(대)'].apply(lambda e: '✅' if e <= HOUR_TOL else '❌')
+        st.markdown("#### 월별로 얼마나 맞혔나 (하루 총량 차이의 중간값, %)")
+        monthly = bt_daily.assign(월=bt_daily['Date'].map(lambda d: f"{d.year}-{d.month:02d}"))
+        st.bar_chart(monthly.groupby('월')['err'].median().rename('차이(%)'))
 
-        row = daily[daily['Date'] == pick].iloc[0]
-        s1, s2, s3 = st.columns(3)
-        s1.metric("실제 하루 총량", f"{int(row['Actual']):,}대")
-        s2.metric("예측 하루 총량", f"{int(row['Predicted']):,}대",
-                  f"{int(row['Predicted'] - row['Actual']):+,}대", delta_color="off")
-        s3.metric("오차율", f"{row['오차율(%)']:.1f}%",
-                  "적중" if row['오차율(%)'] <= TOTAL_TOL else "빗나감",
-                  delta_color="normal" if row['오차율(%)'] <= TOTAL_TOL else "inverse")
-        st.line_chart(one_view.set_index('시간')[['실제 대여량(대)', '예측 대여량(대)']])
-        with st.expander("시간대별 숫자로 보기"):
-            st.dataframe(one_view, hide_index=True, use_container_width=True)
-
-        # ---- 4) 가장 잘 맞힌 날 / 가장 많이 틀린 날 ----
-        st.subheader("가장 잘 맞힌 날 · 가장 많이 틀린 날")
-        rank = daily.assign(요일=daily['Date'].map(lambda d: WEEKDAY_KR[d.weekday()]))
-        rank = rank.rename(columns={'Date': '날짜', 'Actual': '실제(대)', 'Predicted': '예측(대)'})
-        cols = ['날짜', '요일', '실제(대)', '예측(대)', '오차율(%)']
-        b1, b2 = st.columns(2)
-        b1.caption("✅ 가장 잘 맞힌 날 TOP 3")
-        b1.dataframe(rank.nsmallest(3, '오차율(%)')[cols].round(1), hide_index=True, use_container_width=True)
-        b2.caption("❌ 가장 많이 틀린 날 TOP 3")
-        b2.dataframe(rank.nlargest(3, '오차율(%)')[cols].round(1), hide_index=True, use_container_width=True)
-        st.caption(f"※ 판정 기준: 하루 총량 ±{TOTAL_TOL}% 이내면 적중, 시간당 오차 {HOUR_TOL:.0f}대(모델 MAE) 이내면 ✅. "
-                   "많이 틀린 날을 골라 위 '날짜를 골라 시간대별로 비교하기'에서 확인해 보세요.")
+        st.markdown("#### 가장 잘 맞힌 날 · 가장 많이 빗나간 날")
+        show = bt_daily.assign(날짜=bt_daily['Date'].map(date_text), 날씨=[weather_text(t, r) for t, r in
+                                                                       zip(bt_daily['temp'], bt_daily['rain'])])
+        show = show.rename(columns={'Actual': '실제(대)', 'Predicted': '예측(대)', 'err': '차이(%)'})
+        cols = ['날짜', '날씨', '실제(대)', '예측(대)', '차이(%)']
+        b = st.columns(2)
+        b[0].caption("✅ 가장 잘 맞힌 날")
+        b[0].dataframe(show.nsmallest(5, '차이(%)')[cols].round(1), hide_index=True, use_container_width=True)
+        b[1].caption("❌ 가장 많이 빗나간 날")
+        b[1].dataframe(show.nlargest(5, '차이(%)')[cols].round(1), hide_index=True, use_container_width=True)
+        st.caption("※ 각 날짜는 그 날짜가 속한 달을 빼고 학습한 모델로 예측했어요. "
+                   "비가 많이 와서 실제 대여량이 아주 적은 날은 몇천 대만 차이 나도 %가 크게 보여요.")

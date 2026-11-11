@@ -86,10 +86,29 @@ if __name__ == '__main__':
     print(f"[XGBoost 모델]   MAE: {model_mae:.1f}대, R2: {model_r2:.3f}")
     print(f"→ 기준 대비 오차 {(1 - model_mae / base_mae) * 100:.1f}% 감소")
 
-    # 6. 최종 모델은 전체 데이터로 다시 학습해서 저장 (평가 점수는 위에서 구한 값 사용)
+    # 6. 과거 기록 확인용 예측 (월별 교차 예측)
+    #    한 달씩 빼고 나머지 11개월로 학습 → 뺀 달을 예측. 12번 반복하면
+    #    1년 중 모든 날짜에 대해 '그 날짜를 모르는 모델'의 예측이 생김 → 화면의 과거 기록 비교에 사용
+    month_key = df['Date'].dt.to_period('M')
+    backtest = np.zeros(len(df))
+    for m in month_key.unique():
+        hold = (month_key == m).values
+        fold = XGBRegressor(n_estimators=300, learning_rate=0.05, max_depth=6, random_state=42)
+        fold.fit(X[~hold], y[~hold])
+        backtest[hold] = fold.predict(X[hold])
+    pd.DataFrame({
+        'Date': df['Date'].dt.strftime('%Y-%m-%d'), 'Hour': df['Hour'],
+        'Actual': y, 'Predicted': backtest.clip(min=0).round().astype(int),
+        'Temp': df['Temp'], 'Humidity': df['Humidity'], 'Wind': df['Wind'], 'Rain': df['Rainfall'],
+        'Holiday': (df['Holiday'] == 'Holiday').astype(int), 'Weekend': (df['Date'].dt.dayofweek >= 5).astype(int),
+    }).to_csv('backtest_predictions.csv', index=False)
+    print(f"[월별 교차 예측] 1년 전체 MAE: {mean_absolute_error(y, backtest):.1f}대")
+
+    # 7. 최종 모델은 전체 데이터로 다시 학습해서 저장 (평가 점수는 위에서 구한 값 사용)
     model.fit(X, y)
     joblib.dump(model, 'xgboost_bike_model.pkl')
     with open('metrics.json', 'w', encoding='utf-8') as f:
         json.dump({'mae': round(float(model_mae), 1), 'r2': round(float(model_r2), 3),
                    'baseline_mae': round(float(base_mae), 1)}, f, ensure_ascii=False)
-    print("\n모델(xgboost_bike_model.pkl), 평가 결과(metrics.json), 평가 기간 예측(test_predictions.csv) 저장 완료!")
+    print("\n모델(xgboost_bike_model.pkl), 평가 결과(metrics.json), "
+          "평가 기간 예측(test_predictions.csv), 과거 기록 확인용 예측(backtest_predictions.csv) 저장 완료!")
