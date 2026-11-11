@@ -137,7 +137,8 @@ log_model_info()
 
 # ================================= 화면 =================================
 st.title("🚲 서울시 따릉이 대여량 예측 시스템")
-st.write("날씨에 따라 **하루 동안(0~23시) 따릉이를 몇 대 빌릴지** 예측하는 서비스예요.")
+st.write("날씨 예보를 넣으면 **하루 동안(0~23시) 따릉이를 몇 대 빌릴지** 예측해요. "
+         "과거 실제 기록과 비교해 **예측이 얼마나 정확한지**도 확인할 수 있어요.")
 
 tab_predict, tab_check, tab_score = st.tabs(["🔮 예측하기", "✅ 과거 기록으로 확인하기", "📊 전체 성적표"])
 
@@ -151,7 +152,7 @@ with tab_predict:
                                 max_value=datetime.date(2035, 12, 31))
         is_holiday = r1[1].radio("공휴일인가요?", ["아니요", "네"], horizontal=True) == "네"
         r2 = st.columns(4)
-        temp = r2[0].number_input("🌡️ 평균 기온 (℃)", value=20.0, step=0.5, min_value=-20.0, max_value=40.0)
+        temp = r2[0].number_input("🌡️ 평균 기온 (℃)", value=15.0, step=0.5, min_value=-20.0, max_value=40.0)
         humidity = r2[1].number_input("💧 습도 (%)", value=50, step=5, min_value=0, max_value=100)
         wind = r2[2].number_input("🍃 풍속 (m/s)", value=1.5, step=0.1, min_value=0.0, max_value=10.0)
         rain_day = r2[3].number_input("☔ 하루 강수량 (mm)", value=0.0, step=1.0, min_value=0.0, max_value=200.0)
@@ -169,7 +170,25 @@ with tab_predict:
                          "weekend": int(date.weekday() >= 5), "season": SEASON_BY_MONTH[date.month]},
                   pred_total=total, pred_hourly=pred.tolist())
 
+        # 과거 기록에 없던 날씨인지 확인 (같은 달 기준)
+        unusual = []
+        if bt_daily is not None:
+            same_month = bt_daily[bt_daily['Date'].map(lambda d: d.month) == date.month]
+            t_lo, t_hi = same_month['temp'].min(), same_month['temp'].max()
+            h_lo, h_hi = same_month['humidity'].min(), same_month['humidity'].max()
+            r_hi = bt_daily['rain'].max()
+            if not (t_lo - 5 <= temp <= t_hi + 5):
+                unusual.append(f"{date.month}월 평균 기온은 과거 기록에서 {t_lo:.0f}~{t_hi:.0f}℃였는데, 입력값은 {temp:.0f}℃예요")
+            if not (h_lo - 15 <= humidity <= h_hi + 15):
+                unusual.append(f"{date.month}월 평균 습도는 과거 기록에서 {h_lo:.0f}~{h_hi:.0f}%였는데, 입력값은 {humidity}%예요")
+            if rain_day > r_hi:
+                unusual.append(f"하루 강수량은 과거 기록에서 최대 {r_hi:.0f}mm였는데, 입력값은 {rain_day:.0f}mm예요")
+
         st.markdown(f"#### {date_text(date)} 예측 결과")
+        if unusual:
+            st.warning("⚠️ **과거 기록(2017-12 ~ 2018-11)에 없던 날씨라 예측이 정확하지 않을 수 있어요.**\n\n"
+                       + "\n".join(f"- {u}" for u in unusual)
+                       + "\n\n모델은 과거 기록에서 배운 범위 안에서만 정확해요. 실제 날씨 예보 값을 넣어 보세요.")
         m = st.columns(3)
         m[0].metric("하루 동안 빌릴 자전거", f"{total:,}대")
         m[1].metric("가장 붐비는 시간", f"{peak}시", f"{pred[peak]:,}대", delta_color="off")
@@ -178,18 +197,30 @@ with tab_predict:
 
         # 이 예측을 얼마나 믿을 수 있는지: 날씨가 비슷했던 과거 날의 실제 vs 예측
         if bt_daily is not None:
+            st.markdown("#### 🎯 이 예측, 믿어도 될까요?")
             want_off = is_holiday or date.weekday() >= 5
-            cand = bt_daily[bt_daily['dayoff'] == want_off]
-            score = (cand['temp'] - temp).abs() / 5 + (cand['rain'] - rain_day).abs() / 10
+            cand = bt_daily[bt_daily['dayoff'] == want_off].copy()
+            cand['t_gap'] = (cand['temp'] - temp).abs()
+            cand['h_gap'] = (cand['humidity'] - humidity).abs()
+            cand['r_gap'] = (cand['rain'] - rain_day).abs()
+            score = cand['t_gap'] / 3 + cand['h_gap'] / 15 + cand['r_gap'] / 10
             sim = cand.loc[score.idxmin()]
-            st.markdown("#### 🎯 이 예측, 얼마나 믿을 수 있을까요?")
-            show_strip("날씨가 비슷했던 날", "그날 모델이 얼마나 맞혔는지",
-                       [("날짜", date_text(sim['Date']), weather_text(sim['temp'], sim['rain']), 17),
-                        ("실제로 빌린 대수", f"{int(sim['Actual']):,}대", "", 26),
-                        ("모델의 예측", f"{int(sim['Predicted']):,}대", "", 26)],
-                       int(sim['Actual']), int(sim['Predicted']))
-            st.caption(f"※ 과거 기록 중 {'쉬는 날' if want_off else '평일'}이면서 기온·강수량이 가장 비슷했던 날이에요. "
-                       f"차이가 ±{TOTAL_TOL}% 안이면 '잘 맞힘'이에요.")
+            really_similar = sim['t_gap'] <= 3 and sim['h_gap'] <= 15 and sim['r_gap'] <= 10
+            if unusual or not really_similar:
+                st.info(f"과거 기록에 이런 날씨({temp:.0f}℃ · 습도 {humidity}% · "
+                        f"{'비 없음' if rain_day < 0.1 else f'비 {rain_day:.0f}mm'})와 비슷한 날이 없어서, "
+                        "모델이 얼마나 맞힐지 비교해 드릴 수 없어요.")
+            else:
+                st.caption(f"{date}의 실제 대여량은 아직 알 수 없어요. 그래서 **비슷한 날씨였던 과거 하루**를 골라, "
+                           "모델이 그날을 얼마나 맞혔는지 보여드려요.")
+                show_strip("날씨가 비슷했던 날", "그날 모델이 얼마나 맞혔는지",
+                           [("날짜", date_text(sim['Date']),
+                             weather_text(sim['temp'], sim['rain']) + f" · 습도 {sim['humidity']:.0f}%", 17),
+                            ("실제로 빌린 대수", f"{int(sim['Actual']):,}대", "", 26),
+                            ("모델의 예측", f"{int(sim['Predicted']):,}대", "", 26)],
+                           int(sim['Actual']), int(sim['Predicted']))
+                st.caption(f"※ {'쉬는 날' if want_off else '평일'} 중 기온·습도·강수량이 가장 비슷했던 날이에요. "
+                           f"차이가 ±{TOTAL_TOL}% 안이면 '잘 맞힘'이에요.")
 
         with st.expander("시간대별 숫자로 보기"):
             st.dataframe(pd.DataFrame({'시간': range(24), '예측 대여량(대)': pred}),
