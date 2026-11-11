@@ -16,10 +16,12 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 2) 앱 코드와 데이터 복사
-COPY app.py train_model.py SeoulBikeData.csv ./
+COPY app.py train_model.py train_daily_model.py SeoulBikeData.csv daily_dataset.csv ./
 
 # 3) 이미지 안에서 모델 학습 → 컨테이너의 xgboost 버전과 모델 파일 버전이 항상 일치
-RUN python train_model.py
+# - train_model.py: 기존(재학습 전) 시간대별 모델 → 재학습 전 성적 비교용
+# - train_daily_model.py: 서울시 공식 2018~2026 데이터로 재학습한 하루 대여량 모델 (서비스용)
+RUN python train_model.py && python train_daily_model.py
 
 EXPOSE 8501
 
